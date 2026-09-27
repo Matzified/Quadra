@@ -27,8 +27,8 @@ def load_words():
             req = urllib.request.Request('https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english-no-swears.txt')
             with urllib.request.urlopen(req, timeout=5) as response:
                 content = response.read().decode('utf-8')
-                # Filter for cool rare lengths (3 to 5 letters)
-                WORDS = [w.strip() for w in content.split('\n') if 3 <= len(w.strip()) <= 5]
+                # Include short and long words up to 16 letters (Minecraft max)
+                WORDS = [w.strip() for w in content.split('\n') if 3 <= len(w.strip()) <= 16]
             
             # Save it so we don't have to download it next time
             with open('words.txt', 'w') as f:
@@ -207,7 +207,7 @@ HTML = """<!DOCTYPE html>
             <div class="input-group full">
                 <label>Search Mode</label>
                 <select id="mode">
-                    <option value="words">Rare Dictionary Words (3-5 letters)</option>
+                    <option value="words">Rare Dictionary Words (3-16 letters)</option>
                     <option value="random">Random 4-Letter Generated</option>
                 </select>
             </div>
@@ -255,42 +255,64 @@ HTML = """<!DOCTYPE html>
             while (isRunning && totalChecked < attemptsTarget) {
                 try {
                     const mode = el('mode').value;
+                    const batchSize = Math.min(10, attemptsTarget - totalChecked);
                     
-                    // 1. Ask backend for the next target based on mode
-                    const targetRes = await fetch(`/api/next_target?mode=${mode}`);
+                    // 1. Get batch of names to check
+                    const targetRes = await fetch(`/api/get_batch?mode=${mode}&count=${batchSize}`);
                     const targetData = await targetRes.json();
-                    const username = targetData.name;
+                    const namesToCheck = targetData.names;
                     
-                    el('activeUsername').textContent = username;
+                    el('activeUsername').textContent = "BATCH: " + namesToCheck[0] + "...";
                     el('activeUsername').className = 'active-username';
 
-                    // 2. Ask backend to check it
-                    const res = await fetch(`/api/check?name=${username}`);
+                    // 2. Check batch with POST request
+                    const res = await fetch('/api/check_batch', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(namesToCheck)
+                    });
                     const data = await res.json();
-                    totalChecked++;
-
-                    if (data.available) {
-                        el('activeUsername').classList.add('success');
-                        availableNames.push(username);
-                        el('emptyState').style.display = 'none';
-                        const card = document.createElement('div');
-                        card.className = 'result-card';
-                        card.textContent = username;
-                        card.onclick = () => {
-                            navigator.clipboard.writeText(username);
-                            card.textContent = 'COPIED';
-                            setTimeout(() => card.textContent = username, 1000);
-                        };
-                        el('resultsList').prepend(card);
-                    } else if (data.status === 'Rate Limited') {
+                    
+                    if (data.status === 'Rate Limited') {
                         el('activeUsername').textContent = 'RATE LIMIT';
                         el('currentStatus').textContent = 'BLOCKED';
                         await new Promise(r => setTimeout(r, delay * 5));
                         continue;
-                    } else {
-                        el('activeUsername').classList.add('taken');
                     }
-                } catch(e) { totalChecked++; }
+                    
+                    totalChecked += namesToCheck.length;
+
+                    // Process results
+                    if (data.results) {
+                        let foundInBatch = false;
+                        for (const [username, available] of Object.entries(data.results)) {
+                            if (available) {
+                                foundInBatch = true;
+                                availableNames.push(username);
+                                el('emptyState').style.display = 'none';
+                                const card = document.createElement('div');
+                                card.className = 'result-card';
+                                card.textContent = username;
+                                card.onclick = () => {
+                                    navigator.clipboard.writeText(username);
+                                    card.textContent = 'COPIED';
+                                    setTimeout(() => card.textContent = username, 1000);
+                                };
+                                el('resultsList').prepend(card);
+                            }
+                        }
+                        
+                        if (foundInBatch) {
+                            el('activeUsername').classList.add('success');
+                            el('activeUsername').textContent = "FOUND AVAILABLE!";
+                        } else {
+                            el('activeUsername').classList.add('taken');
+                        }
+                    }
+                    
+                } catch(e) { 
+                    console.error(e);
+                }
 
                 el('progressBar').style.width = Math.min((totalChecked/attemptsTarget)*100, 100) + '%';
                 el('checkedCount').textContent = `CHK: ${totalChecked} / ${attemptsTarget}`;
@@ -345,58 +367,67 @@ class QuadraHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(HTML.encode('utf-8'))
             return
             
-        if parsed.path == '/api/next_target':
+        if parsed.path == '/api/get_batch':
             query = urllib.parse.parse_qs(parsed.query)
             mode = query.get('mode', ['random'])[0]
+            count = int(query.get('count', [10])[0])
             
-            if mode == 'words' and WORDS:
-                name = random.choice(WORDS)
-            else:
-                VALID = string.ascii_lowercase + string.digits + "_"
-                name = "".join(random.choice(VALID) for _ in range(4))
-                
+            names = []
+            for _ in range(count):
+                if mode == 'words' and WORDS:
+                    names.append(random.choice(WORDS))
+                else:
+                    VALID = string.ascii_lowercase + string.digits + "_"
+                    names.append("".join(random.choice(VALID) for _ in range(4)))
+            
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"name": name}).encode())
+            self.wfile.write(json.dumps({"names": names}).encode())
             return
             
-        if parsed.path == '/api/check':
-            query = urllib.parse.parse_qs(parsed.query)
-            username = query.get('name', [''])[0]
+        if parsed.path == '/api/check_batch':
+            # Receive POST request with a list of names
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            names_to_check = json.loads(post_data.decode('utf-8'))
             
-            if not username:
+            if not names_to_check:
                 self.send_response(400)
                 self.end_headers()
-                self.wfile.write(b'{"error": "Missing name"}')
                 return
 
-            url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
-            status_code, available, msg = 500, False, "Error"
+            url = "https://api.minecraftservices.com/minecraft/profile/lookup/bulk/byname"
+            
+            results = {}
+            status = "Success"
             
             try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                req = urllib.request.Request(url, data=json.dumps(names_to_check).encode('utf-8'), headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=5) as res:
                     if res.getcode() == 200:
-                        status_code = 200
-                        msg = "Taken"
+                        response_body = res.read().decode('utf-8')
+                        found_profiles = json.loads(response_body)
+                        # Profiles returned are TAKEN
+                        taken_names = [p['name'].lower() for p in found_profiles]
+                        
+                        for name in names_to_check:
+                            if name.lower() in taken_names:
+                                results[name] = False # Taken
+                            else:
+                                results[name] = True  # Available!
             except urllib.error.HTTPError as e:
-                status_code = e.code
-                if e.code == 404:
-                    available = True
-                    msg = "Available"
-                elif e.code == 429:
-                    msg = "Rate Limited"
+                if e.code == 429:
+                    status = "Rate Limited"
             except Exception as e:
-                msg = str(e)
+                status = str(e)
             
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({
-                "username": username,
-                "available": available,
-                "status": msg
+                "results": results,
+                "status": status
             }).encode())
             return
 
